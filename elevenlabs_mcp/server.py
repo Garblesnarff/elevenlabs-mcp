@@ -27,6 +27,8 @@ from elevenlabs_mcp.utils import (
     make_output_path,
     make_output_file,
     handle_input_file,
+    parse_conversation_transcript,
+    handle_large_text,
 )
 from elevenlabs_mcp.convai import create_conversation_config, create_platform_settings
 from elevenlabs.types.knowledge_base_locator import KnowledgeBaseLocator
@@ -63,6 +65,15 @@ mcp = FastMCP("ElevenLabs")
      Args:
         text (str): The text to convert to speech.
         voice_name (str, optional): The name of the voice to use.
+        model_id (str, optional): ID of the ElevenLabs model to use for the agent. Options include:
+            - eleven_v3: Most expressive model with audio tags support (70+ languages)
+            - eleven_multilingual_v2: High quality multilingual model (29 languages)
+            - eleven_flash_v2_5: Fastest model with ultra-low latency (32 languages)
+            - eleven_turbo_v2_5: Balanced quality and speed (32 languages)
+            - eleven_flash_v2: Fast English-only model
+            - eleven_turbo_v2: Balanced English-only model
+            - eleven_monolingual_v1: Legacy English model
+            Defaults to eleven_multilingual_v2 or environment variable ELEVENLABS_MODEL_ID.
         stability (float, optional): Stability of the generated audio. Determines how stable the voice is and the randomness between each generation. Lower values introduce broader emotional range for the voice. Higher values can result in a monotonous voice with limited emotion. Range is 0 to 1.
         similarity_boost (float, optional): Similarity boost of the generated audio. Determines how closely the AI should adhere to the original voice when attempting to replicate it. Range is 0 to 1.
         style (float, optional): Style of the generated audio. Determines the style exaggeration of the voice. This setting attempts to amplify the style of the original speaker. It does consume additional computational resources and might increase latency if set to anything other than 0. Range is 0 to 1.
@@ -108,6 +119,7 @@ def text_to_speech(
     speed: float = 1.0,
     language: str = "en",
     output_format: str = "mp3_44100_128",
+    model_id: str | None = None,
 ):
     if text == "":
         make_error("Text is required.")
@@ -131,7 +143,12 @@ def text_to_speech(
     output_path = make_output_path(output_directory, base_path)
     output_file_name = make_output_file("tts", text, output_path, "mp3")
 
-    model_id = "eleven_flash_v2_5" if language in ["hu", "no", "vi"] else "eleven_multilingual_v2"
+    if model_id is None:
+        model_id = (
+            "eleven_flash_v2_5"
+            if language in ["hu", "no", "vi"]
+            else "eleven_multilingual_v2"
+        )
 
     audio_data = client.text_to_speech.convert(
         text=text,
@@ -251,7 +268,7 @@ def text_to_sound_effects(
     text: str,
     duration_seconds: float = 2.0,
     output_directory: str | None = None,
-    output_format: str = "mp3_44100_128"
+    output_format: str = "mp3_44100_128",
 ) -> list[TextContent]:
     if duration_seconds < 0.5 or duration_seconds > 5:
         make_error("Duration must be between 0.5 and 5 seconds")
@@ -312,7 +329,7 @@ def list_models() -> list[McpModel]:
             languages=[
                 McpLanguage(language_id=lang.language_id, name=lang.name)
                 for lang in model.languages
-            ]
+            ],
         )
         for model in response
     ]
@@ -341,9 +358,7 @@ def voice_clone(
 ) -> TextContent:
     input_files = [str(handle_input_file(file).absolute()) for file in files]
     voice = client.voices.ivc.create(
-        name=name,
-        description=description,
-        files=input_files
+        name=name, description=description, files=input_files
     )
 
     return TextContent(
@@ -511,7 +526,9 @@ def add_knowledge_base_to_agent(
             text_io.content_type = "text/plain"
             file = text_io
         elif input_file_path is not None:
-            path = handle_input_file(file_path=input_file_path, audio_content_check=False)
+            path = handle_input_file(
+                file_path=input_file_path, audio_content_check=False
+            )
             file = open(path, "rb")
 
         response = client.conversational_ai.knowledge_base.documents.create_from_file(
@@ -578,6 +595,131 @@ def get_agent(agent_id: str) -> TextContent:
 
 
 @mcp.tool(
+    description="""Gets conversation with transcript. Returns: conversation details and full transcript. Use when: analyzing completed agent conversations.
+    
+    Args:
+        conversation_id: The unique identifier of the conversation to retrieve, you can get the ids from the list_conversations tool.
+    """
+)
+def get_conversation(
+    conversation_id: str,
+) -> TextContent:
+    """Get conversation details with transcript"""
+    try:
+        response = client.conversational_ai.conversations.get(conversation_id)
+
+        # Parse transcript using utility function
+        transcript, _ = parse_conversation_transcript(response.transcript)
+
+        response_text = f"""Conversation Details:
+ID: {response.conversation_id}
+Status: {response.status}
+Agent ID: {response.agent_id}
+Message Count: {len(response.transcript)}
+
+Transcript:
+{transcript}"""
+
+        if response.metadata:
+            metadata = response.metadata
+            duration = getattr(
+                metadata,
+                "call_duration_secs",
+                getattr(metadata, "duration_seconds", "N/A"),
+            )
+            started_at = getattr(
+                metadata, "start_time_unix_secs", getattr(metadata, "started_at", "N/A")
+            )
+            response_text += (
+                f"\n\nMetadata:\nDuration: {duration} seconds\nStarted: {started_at}"
+            )
+
+        if response.analysis:
+            analysis_summary = getattr(
+                response.analysis, "summary", "Analysis available but no summary"
+            )
+            response_text += f"\n\nAnalysis:\n{analysis_summary}"
+
+        return TextContent(type="text", text=response_text)
+
+    except Exception as e:
+        make_error(f"Failed to fetch conversation: {str(e)}")
+
+
+@mcp.tool(
+    description="""Lists agent conversations. Returns: conversation list with metadata. Use when: asked about conversation history.
+    
+    Args:
+        agent_id (str, optional): Filter conversations by specific agent ID
+        cursor (str, optional): Pagination cursor for retrieving next page of results
+        call_start_before_unix (int, optional): Filter conversations that started before this Unix timestamp
+        call_start_after_unix (int, optional): Filter conversations that started after this Unix timestamp
+        page_size (int, optional): Number of conversations to return per page (1-100, defaults to 30)
+    """
+)
+def list_conversations(
+    agent_id: str | None = None,
+    cursor: str | None = None,
+    call_start_before_unix: int | None = None,
+    call_start_after_unix: int | None = None,
+    page_size: int = 30,
+    max_length: int = 10000,
+) -> TextContent:
+    """List conversations with filtering options."""
+    page_size = min(page_size, 100)
+
+    try:
+        response = client.conversational_ai.conversations.list(
+            cursor=cursor,
+            agent_id=agent_id,
+            call_start_before_unix=call_start_before_unix,
+            call_start_after_unix=call_start_after_unix,
+            page_size=page_size,
+        )
+
+        if not response.conversations:
+            return TextContent(type="text", text="No conversations found.")
+
+        conv_list = []
+        for conv in response.conversations:
+            start_time = datetime.fromtimestamp(conv.start_time_unix_secs).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            conv_info = f"""Conversation ID: {conv.conversation_id}
+Status: {conv.status}
+Agent: {conv.agent_name or 'N/A'} (ID: {conv.agent_id})
+Started: {start_time}
+Duration: {conv.call_duration_secs} seconds
+Messages: {conv.message_count}
+Call Successful: {conv.call_successful}"""
+
+            conv_list.append(conv_info)
+
+        formatted_list = "\n\n".join(conv_list)
+
+        pagination_info = f"Showing {len(response.conversations)} conversations"
+        if response.has_more:
+            pagination_info += f" (more available, next cursor: {response.next_cursor})"
+
+        full_text = f"{pagination_info}\n\n{formatted_list}"
+
+        # Use utility to handle large text content
+        result_text = handle_large_text(full_text, max_length, "conversation list")
+
+        # If content was saved to file, prepend pagination info
+        if result_text != full_text:
+            result_text = f"{pagination_info}\n\n{result_text}"
+
+        return TextContent(type="text", text=result_text)
+
+    except Exception as e:
+        make_error(f"Failed to list conversations: {str(e)}")
+        # This line is unreachable but satisfies type checker
+        return TextContent(type="text", text="")
+
+
+@mcp.tool(
     description="""Transform audio from one voice to another using provided audio files.
 
     ⚠️ COST WARNING: This tool makes an API call to ElevenLabs which may incur costs. Only use when explicitly requested by the user.
@@ -598,6 +740,7 @@ def speech_to_speech(
     if voice is None:
         make_error(f"Voice with name: {voice_name} does not exist.")
 
+    assert voice is not None  # Type assertion for type checker
     file_path = handle_input_file(input_file_path)
     output_path = make_output_path(output_directory, base_path)
     output_file_name = make_output_file("sts", file_path.name, output_path, "mp3")
@@ -690,8 +833,17 @@ def create_voice_from_preview(
     )
 
 
+def _get_phone_number_by_id(phone_number_id: str):
+    """Helper function to get phone number details by ID."""
+    phone_numbers = client.conversational_ai.phone_numbers.list()
+    for phone in phone_numbers:
+        if phone.phone_number_id == phone_number_id:
+            return phone
+    make_error(f"Phone number with ID {phone_number_id} not found.")
+
+
 @mcp.tool(
-    description="""Make an outbound call via Twilio using an ElevenLabs agent.
+    description="""Make an outbound call using an ElevenLabs agent. Automatically detects provider type (Twilio or SIP trunk) and uses the appropriate API.
 
     ⚠️ COST WARNING: This tool makes an API call to ElevenLabs which may incur costs. Only use when explicitly requested by the user.
 
@@ -709,13 +861,27 @@ def make_outbound_call(
     agent_phone_number_id: str,
     to_number: str,
 ) -> TextContent:
-    response = client.conversational_ai.twilio.outbound_call(
-        agent_id=agent_id,
-        agent_phone_number_id=agent_phone_number_id,
-        to_number=to_number,
-    )
+    # Get phone number details to determine provider type
+    phone_number = _get_phone_number_by_id(agent_phone_number_id)
+    
+    if phone_number.provider.lower() == "twilio":
+        response = client.conversational_ai.twilio.outbound_call(
+            agent_id=agent_id,
+            agent_phone_number_id=agent_phone_number_id,
+            to_number=to_number,
+        )
+        provider_info = "Twilio"
+    elif phone_number.provider.lower() == "sip_trunk":
+        response = client.conversational_ai.sip_trunk.outbound_call(
+            agent_id=agent_id,
+            agent_phone_number_id=agent_phone_number_id,
+            to_number=to_number,
+        )
+        provider_info = "SIP trunk"
+    else:
+        make_error(f"Unsupported provider type: {phone_number.provider}")
 
-    return TextContent(type="text", text=f"Outbound call initiated: {response}.")
+    return TextContent(type="text", text=f"Outbound call initiated via {provider_info}: {response}.")
 
 
 @mcp.tool(
